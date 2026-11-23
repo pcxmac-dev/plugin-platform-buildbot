@@ -287,7 +287,7 @@ class BuildbotPlugin(MachinePlugin):
     apis = cards.APIS
     # the Continuous Integration plugins, after the cloud's (760-765): Buildbot after its siblings, GoCD (780) and
     # Jenkins (810), last as the user named the three (Jenkins, GoCD, Buildbot)
-    order = 811
+    order = 772  # the Continuous Integration plugins in the user's naming: Jenkins 770, GoCD 771, Buildbot 772
     ICON = "buildbot"
     SECTION = "ci"  # drawn under the platform's Continuous Integration plugins; "machine" on a platform before it
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "force")

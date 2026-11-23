@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 env:
-  # the library release it is tested against (its plugin API), pinned to a commit: the head of liminal-libs'
-  # release/0.2.0 when this was tested (1.75.3); moved on purpose, never by a push to the branch
-  LIMINAL_LIB_REF: ff205596e877cf7fa9f897154b21efb0e1e812aa
+  # the library release it is tested against (its plugin API): the release branch until a tag is pinned, as every
+  # plugin's is (the library is first-party; the actions below, third-party, are pinned to their releases' commits)
+  LIMINAL_LIB_REF: release/0.2.0
 
 jobs:
   test:

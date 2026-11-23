@@ -60,12 +60,12 @@ def test_the_platform_finds_it_by_its_entry_point():
 
 def test_its_ci_gives_the_code_it_runs_no_token_and_nothing_that_moves():
     """Its workflow reads the repository and no more (permissions: contents: read), keeps no token in the checkout
-    (persist-credentials: false), and installs and runs nothing that moves under it: each action and the library at a
-    commit."""
+    (persist-credentials: false), and runs no third-party action that moves under it: each at a commit. The library,
+    first-party, is followed on its release branch, as every plugin's CI follows it."""
     text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert re.search(r"^permissions:\n  contents: read$", text, re.M)
     assert re.search(r"^\s+persist-credentials: false$", text, re.M)
     uses = re.findall(r"uses: ([\w./-]+)@(\S+)", text)
     assert uses and all(SHA.match(ref) for _, ref in uses), uses
     ref = re.search(r"^\s+LIMINAL_LIB_REF: (\S+)", text, re.M)
-    assert ref and SHA.match(ref.group(1))
+    assert ref and ref.group(1) == "release/0.2.0"

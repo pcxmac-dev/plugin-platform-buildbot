@@ -1090,5 +1090,5 @@ def test_the_plugin_is_one_the_platform_loads():
     assert [k.secret for k in bb.MACHINE.keys] == [False, False, True]
     assert all(k.hint.startswith("optional") for k in bb.MACHINE.keys)  # the page draws them as optional
     assert bb.MACHINE.STEPS == () and not bb.MACHINE.gives("setup")  # no install, start or stop in 0.1.0
-    assert bb.MACHINE.order == 811  # after its siblings GoCD (780) and Jenkins (810): last, as the user named them
+    assert bb.MACHINE.order == 772  # after its siblings Jenkins (770) and GoCD (771): last, as the user named them
     assert Found().any is False

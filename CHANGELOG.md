@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (2026-11-22)
+## 0.1.0 (2026-11-23)
 
 The first release (the user, 2026-11-22: a Continuous Integration class of platform plugins, with Jenkins, GoCD and
 Buildbot in it). Needs liminal-libs>=1.49.0 (plugin API 2.2).
