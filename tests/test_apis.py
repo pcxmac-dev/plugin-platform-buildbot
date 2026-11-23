@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -19,23 +19,26 @@ from plugin_platform_buildbot import apis as cards
 from stand_ins import NOW, PASSWORD, Master, found, login
 
 
-def pattern(call: A.Call) -> tuple[str, re.Pattern, str]:
-    """A call's method, its path as a pattern ({a placeholder} one step of a path), and its JSON-RPC method ("" for
-    none): "POST /api/v2/forceschedulers/{schedulername} (force)"."""
+def pattern(call: A.Call) -> tuple[str, re.Pattern, frozenset, str]:
+    """A call's method, its path as a pattern ({a placeholder} one step of a path), the names its query gives, and its
+    JSON-RPC method ("" for none): "POST /api/v2/forceschedulers/{schedulername} (force)",
+    "GET /api/v2/builders?name={buildername}"."""
     method, _, rest = call.name.partition(" ")
     rpc = re.fullmatch(r"(.*) \((\w+)\)", rest)
     path, method_of = (rpc.group(1), rpc.group(2)) if rpc else (rest, "")
-    rx = re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(path.split("?", 1)[0]))
-    return method, re.compile(rx + r"\Z"), method_of
+    path, _, query = path.partition("?")
+    rx = re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(path))
+    return method, re.compile(rx + r"\Z"), frozenset(parse_qs(query, keep_blank_values=True)), method_of
 
 
 def named(card: A.Api, method: str, url: str, body) -> A.Call | None:
-    """The card's call a request is."""
-    path = urlsplit(url).path
+    """The card's call a request is: its method, its path, the names its query gives, its JSON-RPC method."""
+    parts = urlsplit(url)
+    asked = frozenset(parse_qs(parts.query, keep_blank_values=True))
     said = json.loads(body).get("method", "") if body else ""
     for c in card.calls:
-        m, rx, rpc = pattern(c)
-        if m == method and rx.match(path) and rpc == said:
+        m, rx, query, rpc = pattern(c)
+        if m == method and rx.match(parts.path) and query == asked and rpc == said:
             return c
     return None
 
@@ -48,8 +51,8 @@ def flows() -> tuple[bb.BuildbotPlugin, Master]:
     p.login = login(BUILDBOT_USER="homer", BUILDBOT_PASSWORD=PASSWORD)
     p.status()
     p.refresh()
-    p.force("force", "runtests", "nightly")
-    p.force("release")
+    p.force("force", "runtests", None, "reason", "nightly")
+    p.force("release", None, "old-release", "reason", "a release")
     return p, m
 
 
@@ -102,6 +105,7 @@ def test_its_facts_say_what_it_learned_and_ask_nothing():
 
 @pytest.mark.skipif(os.environ.get("LIMINAL_VENDOR_PAGES") != "1",
                     reason="reaches the makers' pages: LIMINAL_VENDOR_PAGES=1")
-def test_every_address_on_its_card_answers(monkeypatch):
+def test_every_address_on_its_card_answers(monkeypatch, nothing_runs):
     monkeypatch.undo()  # this test alone reaches the network (conftest refuses it to every other)
+    nothing_runs.off()  # and its audit hook's refusals with it
     assert A.dead_links(bb.MACHINE.apis) == []

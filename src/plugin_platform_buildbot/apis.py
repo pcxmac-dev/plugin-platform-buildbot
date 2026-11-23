@@ -39,13 +39,18 @@ BUILDBOT_REST = Api(
     base="http://127.0.0.1:8010/api/v2 (BUILDBOT_URL with /api/v2 after it; the tutorial's master serves its web UI at "
          "localhost:8010)",
     version="REST API version 2 (the data API's), read against Buildbot 4.3 and 4.4's documentation",
-    auth=("the master's web sign-in, whatever it is: none unless its master.cfg sets one (NoAuth is the default); with "
-          "UserPasswordAuth or HTPasswdAuth, a GET of /auth/login with HTTP basic credentials sets a session cookie, "
-          "which every later request sends (the REST API documentation's way); a master signing in through OAuth2 "
-          "(GitHub, GitLab, Google, Bitbucket, Keycloak) is not reached this way. What a user may read and control is "
-          "the master's authz rules (allowRules: AnyEndpointMatcher, ForceBuildEndpointMatcher, ...); by default "
-          "everyone may do everything. The plugin sends the password to /auth/login alone, never over plain http to "
-          "another machine, and keeps the cookie only for the read or the force it signed in for"),
+    auth=("the master's web sign-in, whatever it is (its /config names it): none unless its master.cfg sets one "
+          "(NoAuth is the default); with UserPasswordAuth, HTPasswdAuth or CustomAuth, a GET of /auth/login with HTTP "
+          "basic credentials sets a session cookie (the master answers with a redirect to its web UI, the anonymous "
+          "session's cookie and then the signed-in one's), which every later request sends (the REST API "
+          "documentation's way); RemoteUserAuth takes its user from the web server in front of the master, and a "
+          "master signing in through OAuth2 (GitHub, GitLab, Google, Bitbucket, Keycloak) is not reached this way: the "
+          "plugin sends neither a user nor a password to those. What a user may read and control is the master's authz "
+          "rules (allowRules: AnyEndpointMatcher, ForceBuildEndpointMatcher, ...); by default everyone may do "
+          "everything. The plugin sends the password to /auth/login alone, never over plain http to another machine "
+          "(only localhost itself and a loopback address are this one), keeps the cookie only for the read or the "
+          "force it signed in for, and sends a sign-in the master refused no more until its settings change or Read "
+          "again asks"),
     limits="none: the master is the user's own",
     costs="none: Buildbot is free software (GPL-2.0)",
     links=(
@@ -81,15 +86,20 @@ BUILDBOT_REST = Api(
              _raml("worker"),
              covered="the Workers table: connected or not, paused, its host and version, its builders"),
         Area("Force schedulers", "forcescheduler: the schedulers that force a build (name, label, button_name, "
-                                 "builder_names, all_fields); force by JSON-RPC", _raml("forcescheduler"),
-             covered="the Force schedulers table, and Force… once confirmed"),
+                                 "builder_names, all_fields: their parameters' specs, nested as the force form nests "
+                                 "them, each with its fullName, type, default, required, hide and choices); force by "
+                                 "JSON-RPC, each field's value under its fullName", _raml("forcescheduler"),
+             covered=("the Force schedulers table, and Force… once confirmed: its fields as the scheduler's "
+                      "all_fields give them, each value sent under its fullName")),
         Area("Frontend configuration", "/config: the web server's configuration for its own UI "
                                        "(implementation-defined: the versions its About page shows, Buildbot's, "
                                        "Twisted's and Python's among them, its title, buildbotURL)", _WWW,
              covered="the master's Buildbot version and its title"),
-        Area("Sign-in", "/auth/login with HTTP basic credentials (UserPasswordAuth, HTPasswdAuth) sets the session "
-                        "cookie the REST API is asked with", _REST,
-             covered="when BUILDBOT_USER and BUILDBOT_PASSWORD are set: one sign-in before each read and each force"),
+        Area("Sign-in", "/auth/login with HTTP basic credentials (UserPasswordAuth, HTPasswdAuth, CustomAuth) sets the "
+                        "session cookie the REST API is asked with", _REST,
+             covered=("when BUILDBOT_USER and BUILDBOT_PASSWORD are set and /config names a sign-in that takes them: "
+                      "one sign-in before each read and each force; one refused is not sent again until the settings "
+                      "change or Read again asks")),
         Area("Build requests", "buildrequest: what waits for a worker, claimed or not; cancelled or given a priority "
                                "by JSON-RPC", _raml("buildrequest")),
         Area("Buildsets", "buildset: the build requests made together (by a force, a change, a schedule)",
@@ -122,10 +132,13 @@ BUILDBOT_REST = Api(
     calls=(
         Call("GET /auth/login", "a sign-in with HTTP basic credentials: the session cookie it sets is sent with the "
              "requests after it", "Sign-in",
-             used="before a read and a force when BUILDBOT_USER and BUILDBOT_PASSWORD are set", docs=_REST),
+             used=("before a read and a force when BUILDBOT_USER and BUILDBOT_PASSWORD are set and /config names a "
+                   "sign-in that takes them"), docs=_REST),
         Call("GET /config", "the configuration the web server gives its UI: the versions of Buildbot, Twisted and "
-             "Python (before the www versions option's own), the title, buildbotURL", "Frontend configuration",
-             used="the master's Buildbot version and its title", docs=_WWW),
+             "Python (before the www versions option's own), the title, buildbotURL, the sign-in it takes and who is "
+             "signed in", "Frontend configuration",
+             used=("first, before any sign-in: the sign-in it takes, the master's Buildbot version and its title; "
+                   "again once signed in: who it says is signed in"), docs=_WWW),
         Call("GET /api/v2/builders", "every builder", "Builders", used="the Builders table", docs=_raml("builder")),
         Call("GET /api/v2/builds?order=-buildid&limit=20", "the newest builds, newest first", "Builds",
              used="the Recent builds table", docs=_raml("build")),
@@ -134,12 +147,18 @@ BUILDBOT_REST = Api(
              used="the Force schedulers table and its Force… forms", docs=_raml("forcescheduler")),
         Call("GET /api/v2/forceschedulers/{schedulername}", "one force scheduler", "Force schedulers",
              used="Force…: the scheduler read again before it is asked", docs=_raml("forcescheduler")),
-        Call("GET /api/v2/builders/{builderid_or_buildername}", "one builder, by its id or its name", "Builders",
-             used="Force… of one builder: its builder id, as the web UI's force sends it", docs=_raml("builder")),
+        Call("GET /api/v2/builders?name={buildername}", "the builders filtered by a field's value: the one of that "
+             "name, or none", "Builders",
+             used=("Force… of one builder: its builder id, as the web UI's force sends it, by its name (never an "
+                   "address built of the name: one of digits alone is taken there for an id)"), docs=_REST),
+        Call("GET /api/v2/builders/{builderid_or_buildername}", "one builder, by its id (matched first) or its name",
+             "Builders", docs=_raml("builder")),
         Call("POST /api/v2/forceschedulers/{schedulername} (force)", "a build forced: JSON-RPC method force, with the "
-             "scheduler's fields (reason, branch, revision ...) and the builder", "Force schedulers",
+             "scheduler's fields, each under its fullName (reason, branch, a codebase's app_branch ...), and the "
+             "builder (builderid) or the builders (builderNames: only those the scheduler starts are built)",
+             "Force schedulers",
              used=("Force… once confirmed: a build request for the builder chosen, or for every one the scheduler "
-                   "starts"), docs=_raml("forcescheduler"), writes=True),
+                   "starts as the page listed them"), docs=_raml("forcescheduler"), writes=True),
         Call("GET /api/v2/builders/{builderid_or_buildername}/builds", "one builder's builds", "Builds",
              docs=_raml("build")),
         Call("GET /api/v2/builds/{buildid}", "one build", "Builds", docs=_raml("build")),

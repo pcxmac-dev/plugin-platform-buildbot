@@ -7,24 +7,35 @@ plugins).
 
 - Where (settings.py): the master's web address, BUILDBOT_URL (http://127.0.0.1:8010 unless set: the tutorial's master
   on this machine), with BUILDBOT_USER and BUILDBOT_PASSWORD for a master whose web UI asks a sign-in, each read through
-  the plugin's login. The password goes to the master's /auth/login alone, never over plain http to another machine,
-  and is never said, logged or kept (client.py).
+  the plugin's login. The password goes to the master's /auth/login alone, never over plain http to another machine
+  (only the name localhost itself and a loopback address are this machine), and is never said, logged or kept
+  (client.py).
 - Installed here (finders.py): its files alone say it: the buildbot command, a master's folder holding its buildbot.tac,
-  the buildbot-worker command and a worker's folder, and on Linux a systemd unit named buildbot; nothing is run to know
-  it.
-- What it reads: one GET each of the web server's /config (the versions its About page shows, Buildbot's among them),
-  /api/v2/builders, /api/v2/builds (the 20 newest), /api/v2/workers and /api/v2/forceschedulers, after a sign-in when a
-  user is set; kept READ_S, so the page's refreshes do not ask again; a failure said in words on the page, never raised.
-- What it changes: a force scheduler's force (one JSON-RPC POST, sent once), confirmed on the page first. Nothing is
-  installed, started or stopped by this release: when no master answers, the page says how to install and start one
-  (a virtual environment, pip install 'buildbot[bundle]', buildbot create-master, buildbot-worker for the workers), with
-  the documentation's addresses.
+  the buildbot-worker command and a worker's folder; on Linux a systemd unit named buildbot*, an init script and the
+  folders /etc/default's files name; on Windows Buildbot's own service (BuildBot), by its registry key; nothing is run
+  to know it.
+- What it reads: one GET of the web server's /config first (the versions its About page shows, Buildbot's among them,
+  and the sign-in it takes), then the sign-in when a user is set and that sign-in takes a user and a password
+  (UserPasswordAuth, HTPasswdAuth, CustomAuth; never NoAuth, RemoteUserAuth or an OAuth2 provider's) and /config again
+  as that user, then one GET each of /api/v2/builders, /api/v2/builds (the 20 newest), /api/v2/workers and
+  /api/v2/forceschedulers; kept READ_S, so the page's refreshes do not ask again, and never queued behind: while a read
+  is under way another ask waits WAIT_S at most, then takes what was read before. A sign-in the master refused is not
+  sent again until the settings change or Read again asks. A failure is said in words on the page, never raised.
+- What it changes: a force scheduler's force (one JSON-RPC POST, sent once), confirmed on the page first: its fields
+  are the scheduler's own, as its all_fields say them (fields.py), each value sent under the name the force takes it
+  by, and every builder it starts is the list the page showed. Nothing is installed, started or stopped by this
+  release: when no master answers, the page says how to install and start one (a virtual environment, activated, pip
+  install 'buildbot[bundle]', buildbot create-master, buildbot-worker for the workers), with the documentation's
+  addresses.
 
 Nothing runs on its own: the plugin reads when the platform asks, holds no process, thread or connection between asks,
-and forgets what it read when its settings change and when it is detached."""
+and forgets what it read when its settings change, after a force and when it is detached; a read under way then keeps
+nothing of what it read (its generation is gone), though its asker gets it."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import platform
 import re
 import threading
@@ -35,13 +46,15 @@ from urllib.parse import quote
 from liminal_libs.machines.plugin import MachinePlugin
 
 from . import apis as cards
-from .client import API, FORCE_S, LOOK_S, BuildbotError, Master
+from .client import API, FORCE_S, LOOK_S, BuildbotError, Master, no_basic
+from .fields import FIELDS_MOST, TEXT_MOST, fields_of, form_field, offered, typed, typed_fields, unfillable
 from .finders import Finder, Found
 from .settings import KEYS, Settings
 from .settings import read as read_settings
 
 __version__ = "0.1.0"
 READ_S = 30.0  # what was read is kept this long: the platform's page asks every few seconds; a force reads again
+WAIT_S = 2.0  # seconds an ask waits for a read under way, at most: then it takes what was read before
 BUILDS = 20  # the newest builds read
 ROWS = 200  # a table's rows at most
 FORMS = 20  # the force schedulers given a form each, at most
@@ -50,8 +63,9 @@ LISTINGS = (("builders", None), ("builds", {"order": "-buildid", "limit": BUILDS
 LABELS = {"builders": "builders", "builds": "recent builds", "workers": "workers",
           "forceschedulers": "force schedulers"}
 RESULTS = {0: "success", 1: "warnings", 2: "failure", 3: "skipped", 4: "exception", 5: "retry", 6: "cancelled"}
-SCHEDULER = re.compile(r"^(?!\d)[\w-]{1,100}$")  # a force scheduler's name: an identifier (letters, digits, _ and -)
-TEXT_MOST = 200  # characters of a builder's name, a reason, a branch or a revision typed on the page, at most
+# a force scheduler's name as the master's REST API takes it in an address (/forceschedulers/i:schedulername: ASCII
+# letters, digits, _ and -); Buildbot's own names take more letters, but such a one cannot be asked by its address
+SCHEDULER = re.compile(r"^[A-Za-z_-][A-Za-z0-9_-]{0,99}$")
 DOCS = "https://docs.buildbot.net/latest/"
 FIRST_RUN = DOCS + "tutorial/firstrun.html"
 BUILDMASTER = DOCS + "manual/installation/buildmaster.html"
@@ -130,50 +144,61 @@ def capped(rows: list, note: str, total: int | None = None) -> tuple[list, str]:
     return rows, note
 
 
-def typed(value, what: str, spaces: bool = True) -> str:
-    """A field typed on the page: "" for none; ValueError in words for one too long, holding a line break or a control
-    character, or a space where none goes (a branch, a revision)."""
-    said = str(value if value is not None else "").strip()
-    if not said:
-        return ""
-    if len(said) > TEXT_MOST:
-        raise ValueError(f"{what} is {TEXT_MOST} characters at most")
-    if any(ord(c) < 32 or ord(c) == 127 for c in said):
-        raise ValueError(f"{what} holds a line break or a control character")
-    if not spaces and any(c.isspace() for c in said):
-        raise ValueError(f"{what} holds no space")
-    return said
+def starts_of(scheduler: dict) -> list[str]:
+    """The builders a force scheduler starts, by name, as the master says them."""
+    return [b for b in scheduler.get("builder_names") or () if isinstance(b, str)]
 
 
-def install_steps(system: str) -> list[tuple[str, str, str, str]]:
+def told(e: BuildbotError, signed: str) -> BuildbotError:
+    """A refusal (401, 403) said with why no sign-in went with the request (`signed`), when none did; else the error
+    as it is."""
+    return BuildbotError(f"{e}; {signed}", e.status) if signed and e.refused else e
+
+
+def joined(names) -> str:
+    """Builders' names as a form's fixed field holds them, ", " between them (what Force… confirmed)."""
+    return ", ".join(names)
+
+
+def install_steps(system: str) -> list[tuple[str, object, str, str]]:
     """The documentation's steps to install and start Buildbot (its tutorial's First run), each (what, the command as
-    this system's shell types it, its page, what of it the look here finds: "commands", "masters", "worker_commands",
-    "workers", or "" for a step it cannot see). On Windows each is typed in the home folder, alike in the Command
-    Prompt and in PowerShell."""
+    this system's shell types it: a cell with another shell's way, or a note, under it where one differs; its page;
+    what of it the look here finds: "commands", "masters", "worker_commands", "workers", or "" for a step it cannot
+    see). Git comes first (the sample's runtests build checks its code out with it); the sandbox is activated once,
+    as the tutorial does, and every step after it is typed in that shell: so the worker started there runs its builds
+    with the sandbox on its PATH, where they find its programs (the runtests build runs Twisted's trial). On Windows
+    each is typed in the home folder, the Command Prompt's way, with PowerShell's under it where it differs."""
     if system == "windows":
-        home = "buildbot"
-        tools = ".\\buildbot\\sandbox\\Scripts\\"
-        master, worker = home + "\\master", home + "\\worker"
-        made = f"py -m venv {home}\\sandbox"
-        bundle = f'{tools}pip install "buildbot[bundle]"'
+        master, worker = "buildbot\\master", "buildbot\\worker"
+        made = "py -m venv buildbot\\sandbox"
+        activate = cell("buildbot\\sandbox\\Scripts\\activate.bat",
+                        "in PowerShell: .\\buildbot\\sandbox\\Scripts\\Activate.ps1 (where PowerShell refuses to run "
+                        "it, the Command Prompt's way)")
+        bundle = 'pip install "buildbot[bundle]"'
         sample = f"copy {master}\\master.cfg.sample {master}\\master.cfg"
     else:
-        home = "~/buildbot"
-        tools = home + "/sandbox/bin/"
-        master, worker = home + "/master", home + "/worker"
-        made = f"python3 -m venv {home}/sandbox"
-        bundle = f"{tools}pip install 'buildbot[bundle]'"
+        master, worker = "~/buildbot/master", "~/buildbot/worker"
+        made = "python3 -m venv ~/buildbot/sandbox"
+        activate = "source ~/buildbot/sandbox/bin/activate"
+        bundle = "pip install 'buildbot[bundle]'"
+        if system == "linux":
+            bundle = cell(bundle, "on Linux pip may need these first (the tutorial's): sudo apt-get install "
+                                  "build-essential python3-dev libssl-dev libffi-dev on Debian and Ubuntu, sudo yum "
+                                  "install gcc python3-devel openssl-devel libffi-devel on RHEL, CentOS and Fedora")
         sample = f"mv {master}/master.cfg.sample {master}/master.cfg"
     return [
+        ("Git on PATH: the sample's runtests build checks its code out with it", "git --version", FIRST_RUN, ""),
         ("A virtual environment for it", made, FIRST_RUN, ""),
+        ("It activated, as the tutorial does: the steps below are typed in this shell", activate, FIRST_RUN, ""),
         ("Buildbot in it, its web UI with it (the bundle)", bundle, FIRST_RUN, "commands"),
-        ("A master", f"{tools}buildbot create-master {master}", BUILDMASTER, "masters"),
+        ("A master", f"buildbot create-master {master}", BUILDMASTER, "masters"),
         ("Its configuration, from the sample (its web UI on port 8010)", sample, BUILDMASTER, ""),
-        ("Start it", f"{tools}buildbot start {master}", LAUNCHING, ""),
-        ("A worker's code", f"{tools}pip install buildbot-worker", WORKER, "worker_commands"),
+        ("Start it", f"buildbot start {master}", LAUNCHING, ""),
+        ("A worker's code", "pip install buildbot-worker", WORKER, "worker_commands"),
         ("A worker, as the sample's master knows it",
-         f"{tools}buildbot-worker create-worker {worker} localhost example-worker pass", WORKER, "workers"),
-        ("Start the worker", f"{tools}buildbot-worker start {worker}", LAUNCHING, ""),
+         f"buildbot-worker create-worker {worker} localhost example-worker pass", WORKER, "workers"),
+        ("Start the worker, in that shell: its builds run with the sandbox on their PATH (runtests runs trial from it)",
+         f"buildbot-worker start {worker}", LAUNCHING, ""),
     ]
 
 
@@ -183,7 +208,8 @@ class Reading:
     none), what is installed here, whether a web server answered there (`reachable`: any HTTP status) and whether
     Buildbot's REST API did (`answering`: its builders read), why not in words, what /config said (the versions by
     name, the title, the sign-in it names), the user signed in as, the four listings (None: not read) with the totals
-    the master counts and why one was not read, and the settings' and the sign-in's words."""
+    the master counts and why one was not read, the settings' and the sign-in's words, and whether it only says that
+    another asker's read is under way (`underway`: nothing of the master read, never kept)."""
 
     at: float
     when: float
@@ -203,6 +229,7 @@ class Reading:
     totals: dict = field(default_factory=dict)
     problems: dict = field(default_factory=dict)
     notes: tuple = ()
+    underway: bool = False
 
     @property
     def present(self) -> bool:
@@ -221,13 +248,18 @@ def _seen() -> dict:
 
 class _Runtime:
     """What the plugin keeps while it lives, shared by its copies (the registry hands out a shallow one): the last
-    reading, and what its requests came to (its API facts)."""
+    reading, what its requests came to (its API facts), the generation of what is read (moved on by each forget: a
+    read under way keeps nothing once its generation is gone), and the sign-in the master refused (a salted digest of
+    its user and password, never the password: not sent again until the settings change or Read again asks)."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.reading_lock = threading.Lock()  # one read at a time: a second asker waits, then takes it
+        self.reading_lock = threading.Lock()  # one read at a time: another asker waits WAIT_S at most
         self.reading: Reading | None = None
         self.seen = _seen()
+        self.generation = 0
+        self.refused = ""
+        self.salt = os.urandom(16)
 
 
 def versions_of(config) -> dict:
@@ -253,15 +285,20 @@ class BuildbotPlugin(MachinePlugin):
     api = "2.2"
     # what it attaches to (plugin API 2.2): the master's REST API, with its /config and /auth/login (apis.py)
     apis = cards.APIS
-    order = 772  # the Continuous Integration plugins, after the cloud's (760-765): Jenkins, GoCD, Buildbot, as named
+    # the Continuous Integration plugins, after the cloud's (760-765): Buildbot after its siblings, GoCD (780) and
+    # Jenkins (810), last as the user named the three (Jenkins, GoCD, Buildbot)
+    order = 811
     ICON = "buildbot"
     SECTION = "ci"  # drawn under the platform's Continuous Integration plugins; "machine" on a platform before it
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "force")
     READ_HOOKS = ("refresh",)  # its own read beside its bases' (force changes the master: a build is asked of it)
     INTERNAL_NOTES = (
-        "force sends one JSON-RPC call (POST /api/v2/forceschedulers/<name>, method force) once its scheduler and its "
-        "builder are read from the master again; refresh reads the master again now. Every request goes to "
-        "BUILDBOT_URL alone, the password to its /auth/login alone.",
+        "force sends one JSON-RPC call (POST /api/v2/forceschedulers/<name>, method force) once its scheduler is read "
+        "from the master again (and its builder, by name): each value under the name its all_fields give the field, "
+        "every builder as the page listed them; refresh reads the master again now.",
+        "Every request goes to BUILDBOT_URL alone; the password to its /auth/login alone, and only when its /config "
+        "names a sign-in that takes one. A sign-in it refused is not sent again until the settings change or Read "
+        "again asks.",
     )
     keys = KEYS  # its settings, kept through the platform's login: the master's address, a user and its password
 
@@ -283,31 +320,87 @@ class BuildbotPlugin(MachinePlugin):
         except Exception as e:  # noqa: BLE001 - a look that failed: nothing found, and why
             return Found(trouble=f"{type(e).__name__}: {e}")
 
-    def _noted(self, status: int, seconds: float, error: str) -> None:
-        """What one request came to, for its API facts: counted, the last kept (its words hold no secret)."""
+    def _noted(self, status: int, seconds: float, error: str, generation: int) -> None:
+        """What one request came to, for its API facts: counted, the last kept (its words hold no secret); nothing of
+        a generation that is gone (a request of a read under way when the plugin forgot, or was detached)."""
         with self._rt.lock:
+            if generation != self._rt.generation:
+                return
             seen = self._rt.seen
             seen["requests"] += 1
             seen["failed"] += 1 if (status == 0 or error) else 0
             seen.update(status=status, ms=seconds * 1000.0, at=self._wall(), error=error)
 
-    def _master(self, s: Settings, timeout: float) -> Master:
+    def _master(self, s: Settings, timeout: float, generation: int) -> Master:
         return Master(s.where, user=s.user if s.sign_in else "", password=s.password if s.sign_in else "",
-                      transport=self._http, timeout=timeout, note=self._noted, clock=self._clock)
+                      transport=self._http, timeout=timeout, clock=self._clock,
+                      note=lambda status, seconds, error: self._noted(status, seconds, error, generation))
+
+    def _key(self, s: Settings) -> str:
+        """A sign-in's user and password as the runtime remembers a refused one: their salted digest."""
+        return hashlib.sha256(self._rt.salt + f"{s.user}\0{s.password}".encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _sign_in(self, master: Master, s: Settings, auth, generation: int) -> str:
+        """The sign-in, when a user is set and the master's /config names a sign-in that takes a user and a password
+        at /auth/login (or names none it could be read for): "" when signed in; else why not, in words. One the master
+        refused is not sent again (the runtime remembers it) until the settings change or Read again asks.
+        BuildbotError when no answer came."""
+        if not s.sign_in:
+            return ""
+        skip = no_basic(auth)
+        if skip:
+            return skip
+        key = self._key(s)
+        with self._rt.lock:
+            refused = self._rt.refused == key
+        if refused:
+            return (f"the master refused the sign-in as {s.user} before: it is not sent again until the settings "
+                    "change or Read again asks; read as anyone")
+        said = master.sign_in(line(auth.get("name"), 40) if isinstance(auth, dict) else "")
+        if master.refused:
+            with self._rt.lock:
+                if self._rt.generation == generation:
+                    self._rt.refused = key
+        return said
 
     def _read(self, fresh: bool = False) -> Reading:
-        """The master and this machine read, kept READ_S (`fresh`: read now)."""
-        with self._rt.reading_lock:
-            with self._rt.lock:
-                kept = self._rt.reading
+        """The master and this machine read, kept READ_S (`fresh`: read now). While another read is under way this
+        waits WAIT_S at most, then takes what was read before (or a reading saying one is under way), so the page's
+        asks never queue behind a slow master. A read whose generation is gone by its end (its settings changed, a
+        force, a detach) gives its asker what it read and keeps nothing of it."""
+        rt = self._rt
+        with rt.lock:
+            kept = rt.reading
+        if kept is not None and not fresh and self._clock() - kept.at < READ_S:
+            return kept
+        got = rt.reading_lock.acquire(timeout=WAIT_S) if WAIT_S > 0 else rt.reading_lock.acquire(blocking=False)
+        if not got:
+            with rt.lock:
+                kept = rt.reading
+            return kept if kept is not None else self._underway()
+        try:
+            with rt.lock:
+                kept, generation = rt.reading, rt.generation
             if kept is not None and not fresh and self._clock() - kept.at < READ_S:
-                return kept
-            reading = self._ask(read_settings(self.login), self._found())
-            with self._rt.lock:
-                self._rt.reading = reading
+                return kept  # read meanwhile by the asker waited on
+            reading = self._ask(read_settings(self.login), self._found(), generation)
+            with rt.lock:
+                if rt.generation == generation:
+                    rt.reading = reading
             return reading
+        finally:
+            rt.reading_lock.release()
 
-    def _ask(self, s: Settings, found: Found) -> Reading:
+    def _underway(self) -> Reading:
+        """A reading saying another asker's read of the master is under way (never kept): this machine is looked at
+        all the same."""
+        s = read_settings(self.login)
+        url = s.where.base if s.where is not None else ""
+        why = f"a read of the master at {url} is under way: its answer is not in yet" if url else s.problems[0]
+        return Reading(self._clock(), self._wall(), url, self._found(), why=why, notes=tuple(s.problems),
+                       underway=bool(url))
+
+    def _ask(self, s: Settings, found: Found, generation: int) -> Reading:
         """One read of the master (the module docstring's GETs, in order): a request that gets no answer before any
         has means nothing answers there; one that gets none after leaves the rest not asked."""
         at, when = self._clock(), self._wall()
@@ -315,44 +408,50 @@ class BuildbotPlugin(MachinePlugin):
         if s.where is None:
             return Reading(at, when, "", found, why=s.problems[0], notes=tuple(notes))
         url = s.where.base
-        master = self._master(s, LOOK_S)
-
-        def nobody(e: BuildbotError) -> Reading:
-            return Reading(at, when, url, found, why=f"nothing answers at {url}: {e}", notes=tuple(notes))
-
-        try:
-            said = master.sign_in() if s.sign_in else ""
-        except BuildbotError as e:
-            return nobody(e)
-        if said:
-            notes.append(said)
-        asks = [("config", lambda: master.get("/config"))]
-        asks += [(kind, lambda k=kind, p=params: master.listing(f"{API}/{k}", k, p)) for kind, params in LISTINGS]
+        master = self._master(s, LOOK_S, generation)
         got: dict = {}
         problems: dict = {}
         statuses: dict = {}
         stopped = ""
-        for kind, ask in asks:
+        try:
+            got["config"] = master.get("/config")
+        except BuildbotError as e:
+            if not e.answered:
+                return Reading(at, when, url, found, why=f"nothing answers at {url}: {e}", notes=tuple(notes))
+            problems["config"], statuses["config"] = str(e), e.status
+        config = got.get("config") if isinstance(got.get("config"), dict) else {}
+        if "config" in got and not config:
+            problems["config"] = "GET /config: its answer is no configuration"
+        auth = config.get("auth") if isinstance(config.get("auth"), dict) else None
+        try:
+            said = self._sign_in(master, s, auth, generation)
+        except BuildbotError as e:  # its sign-in failed: answered (said, read as anyone), or no answer came
+            said = f"the master's sign-in failed ({e}): read as anyone" if e.answered else ""
+            stopped = "" if e.answered else f"the master stopped answering ({e})"
+        if said:
+            notes.append(said)
+        signed_in = master.signed_in
+        if signed_in and not stopped:  # who its /config says is signed in, as that user
+            try:
+                again = master.get("/config")
+                user = again.get("user") if isinstance(again, dict) else None
+                if isinstance(user, dict) and user.get("anonymous") is True:
+                    notes.append(f"the master set a session cookie for {signed_in}, but its /config says no one is "
+                                 "signed in: read as anyone")
+                    signed_in = ""
+            except BuildbotError as e:
+                if not e.answered:
+                    stopped = f"the master stopped answering ({e})"
+        for kind, params in LISTINGS:
             if stopped:
                 problems[kind] = f"not asked: {stopped}"
                 continue
             try:
-                got[kind] = ask()
+                got[kind] = master.listing(f"{API}/{kind}", kind, params)
             except BuildbotError as e:
-                if not e.answered and not master.answered:
-                    return nobody(e)
                 problems[kind], statuses[kind] = str(e), e.status
                 if not e.answered:
                     stopped = f"the master stopped answering ({e})"
-        config = got.get("config") if isinstance(got.get("config"), dict) else {}
-        if "config" in got and not config:
-            problems["config"] = "GET /config: its answer is no configuration"
-        auth, user = config.get("auth"), config.get("user")
-        signed_in = master.signed_in
-        if signed_in and isinstance(user, dict) and user.get("anonymous") is True:  # its config.user: the session's
-            notes.append(f"the master set a session cookie for {signed_in}, but its /config says no one is signed in: "
-                         "read as anyone")
-            signed_in = ""
         rows = {kind: tuple(got[kind][0]) for kind, _ in LISTINGS if kind in got}
         answering = "builders" in rows
         unread = "" if answering else self._unread(url, signed_in, notes, problems.get("builders", ""),
@@ -383,20 +482,27 @@ class BuildbotPlugin(MachinePlugin):
         return f"the master at {url} could not be read: {problem or 'its builders were not read'}"
 
     def _forget(self) -> None:
+        """What was read is forgotten, and a read under way keeps nothing of what it reads: its generation is gone."""
         with self._rt.lock:
             self._rt.reading = None
+            self._rt.generation += 1
 
     def settings_changed(self) -> None:
-        """Its settings kept anew on the platform's page: what was read is forgotten, so the next look asks the address
-        now set, as the user now set."""
+        """Its settings kept anew on the platform's page: what was read is forgotten (a read under way keeps nothing),
+        and a sign-in the master refused may be sent again, so the next look asks the address now set, as the user
+        now set."""
+        with self._rt.lock:
+            self._rt.refused = ""
         self._forget()
 
     def detach(self) -> None:
-        """Detached (the platform ending, the plugin turned off): what it read goes, and what its requests came to;
-        nothing of its own was running."""
+        """Detached (the platform ending, the plugin turned off): what it read goes, what its requests came to and the
+        sign-in it remembers refused, and a read under way keeps nothing; nothing of its own was running."""
         with self._rt.lock:
             self._rt.reading = None
             self._rt.seen = _seen()
+            self._rt.refused = ""
+            self._rt.generation += 1
         super().detach()
 
     # -- the hooks ---------------------------------------------------------------------------------------------------
@@ -456,8 +562,15 @@ class BuildbotPlugin(MachinePlugin):
         return {cards.REST: facts}
 
     def refresh(self) -> dict:
-        """The master read again now (what was read is kept READ_S otherwise)."""
+        """The master read again now (what was read is kept READ_S otherwise), a sign-in it refused before sent once
+        more."""
+        with self._rt.lock:
+            self._rt.refused = ""
+            before = self._rt.reading
         r = self._read(fresh=True)
+        if r.underway or (before is not None and r is before):
+            return {"said": "a read of the master is under way already: Read again once it has ended", "ok": False,
+                    "lines": [r.why] if r.underway else []}
         if not r.answering:
             return {"said": f"read again: {r.why}", "ok": False, "lines": list(r.notes)}
         workers = r.workers or ()
@@ -467,68 +580,121 @@ class BuildbotPlugin(MachinePlugin):
         lines += [f"its {LABELS[kind]} could not be read: {why}" for kind, why in r.problems.items() if kind in LABELS]
         return {"said": f"read the master at {r.url} again now", "ok": True, "lines": lines + list(r.notes)}
 
-    def force(self, scheduler, builder=None, reason=None, branch=None, revision=None) -> dict:
+    def force(self, scheduler, builder=None, starts=None, fields=None, *values) -> dict:
         """A build forced through the force scheduler named, as its button in the master's web UI forces one: of the
-        builder named (one the scheduler starts), or of every builder it starts when none is; with `reason`, `branch`
-        and `revision` when they are given (the scheduler's own otherwise). The scheduler is read from the master again
-        first (and the builder, for its id, as the web UI sends it), then one JSON-RPC call is sent, once:
-        POST /api/v2/forceschedulers/<name> {"method": "force"}. Refused in words before anything is sent for a name
-        that is none, a field that cannot be one, and a scheduler or a builder the master does not have."""
+        builder named (one the scheduler starts), or of every builder it starts, with the values typed for its fields.
+        `starts`: the builders the page listed, ", " between them (refused when the scheduler now starts others);
+        `fields`: the names its all_fields give the fields typed, ", " between them; `values`: one each, in that order
+        (None: the scheduler's own). The scheduler is read from the master again first (and the builder, by its name,
+        for its id as the web UI sends it); then one JSON-RPC call is sent, once: POST /api/v2/forceschedulers/<name>
+        {"method": "force"}, each value under its field's name, every builder by name (builderNames: the master adds
+        none). Refused in words before it is sent for a name that is none, a value that cannot be one, a field the
+        scheduler does not take, fixes or hides, one it needs that was not given, and a scheduler or a builder the
+        master does not have."""
         name = str(scheduler if scheduler is not None else "").strip()
         if not SCHEDULER.match(name):
-            raise ValueError(f"not a force scheduler's name: {name[:60]!r} (letters, digits, _ and -)")
+            raise ValueError(f"not a force scheduler's name: {name[:60]!r} (ASCII letters, digits, _ and -)")
         chosen = typed(builder, "a builder's name")
-        params: dict = {}
-        for key, value, spaces in (("reason", reason, True), ("branch", branch, False), ("revision", revision, False)):
-            said = typed(value, f"the {key}", spaces)
-            if said:
-                params[key] = said
+        given = typed_fields(fields, values)
         s = read_settings(self.login)
         if s.where is None:
             raise ValueError(s.problems[0])
         url = s.where.base
-        master = self._master(s, LOOK_S)
+        with self._rt.lock:
+            generation = self._rt.generation
+        master = self._master(s, LOOK_S, generation)
         path = f"{API}/forceschedulers/{quote(name, safe='')}"
-        signed = master.sign_in() if s.sign_in else ""
+        try:
+            config = master.get("/config")
+        except BuildbotError as e:
+            if not e.answered:
+                raise
+            config = {}
+        auth = config.get("auth") if isinstance(config, dict) and isinstance(config.get("auth"), dict) else None
+        signed = self._sign_in(master, s, auth, generation)
         try:
             found, _ = master.listing(path, "forceschedulers")
         except BuildbotError as e:
             if e.status == 404:
                 raise ValueError(f"the master at {url} has no force scheduler named {name}") from None
-            raise
+            raise told(e, signed) from None
         sched = next((x for x in found if x.get("name") == name), None)
         if sched is None:
             raise ValueError(f"the master at {url} has no force scheduler named {name}")
-        starts = [b for b in sched.get("builder_names") or () if isinstance(b, str)]
+        current = starts_of(sched)
+        params = self._params(sched, given, name)
         if chosen:
-            if chosen not in starts:
-                raise ValueError(f"{name} does not start {chosen}: it starts {', '.join(starts) or 'no builder'}")
+            if chosen not in current:
+                raise ValueError(f"{name} does not start {chosen}: it starts {joined(current) or 'no builder'}")
             params["builderid"] = self._builder_id(master, chosen, url)
+        else:
+            if not current:
+                raise ValueError(f"{name} starts no builder: there is nothing to force")
+            if starts is not None and str(starts) != joined(current):
+                raise ValueError(self._moved(name, str(starts), current))
+            params["builderNames"] = current
         try:
             result = master.control(path, "force", params, timeout=FORCE_S)
         except BuildbotError as e:
             if not e.answered:
                 raise BuildbotError(f"{e}: no answer came, so it may have been done (Read again shows it under Recent "
                                     "builds)") from None
-            raise
+            raise told(e, signed) from None
         finally:
             self._forget()
-        what = chosen or f"every builder {name} starts ({', '.join(starts) or 'none'})"
+        what = chosen or f"every builder {name} starts ({joined(current)})"
         lines = self._made(result)
+        typed_in = [k for k in params if k not in ("builderid", "builderNames")]
+        lines.append(f"with {', '.join(typed_in)} as typed, the rest the scheduler's own" if typed_in else
+                     "with the scheduler's own values")
         if signed:
             lines.append(signed)
         lines.append("it runs once a worker is free: Read again shows it under Recent builds")
         return {"said": f"a build of {what} asked of the master at {url}", "lines": lines, "ok": True}
 
     @staticmethod
+    def _moved(name: str, confirmed: str, current: list[str]) -> str:
+        """The words of a force refused because the scheduler's builders are no longer those the page listed."""
+        was = [n for n in confirmed.split(", ") if n]
+        more = [n for n in current if n not in was]
+        fewer = [n for n in was if n not in current]
+        parts = ([f"now starts {joined(more)} too"] if more else []) + (
+            [f"no longer starts {joined(fewer)}"] if fewer else [])
+        said = " and ".join(parts) or f"now starts {joined(current)}"
+        return f"{name} {said}: review it again (Read again shows what it starts)"
+
+    @staticmethod
+    def _params(sched: dict, given: dict, name: str) -> dict:
+        """The force's params from the values typed, each under its field's own name (its fullName), checked against
+        the scheduler as just read: ValueError in words, before anything is sent, for a field it does not take, one it
+        fixes or hides or that this page cannot fill, a value that is not the field's, and a field it needs that was
+        not given."""
+        fields: dict = {}
+        for f in fields_of(sched):
+            fields.setdefault(f.full, f)
+        params: dict = {}
+        for full, value in given.items():
+            f = fields.get(full)
+            if f is None:
+                raise ValueError(f"{name} takes no field {full}: review it again (Read again shows its fields)")
+            why = f.not_offered()
+            if why:
+                raise ValueError(f"{name}'s {f.label} ({full}) takes no value from this page: {why}")
+            params[full] = f.value(value)
+        missing = unfillable(list(fields.values()))
+        if missing is not None:
+            raise ValueError(f"{name} needs its {missing.label} ({missing.full}), which this page cannot fill "
+                             f"({missing.not_offered()}): force it from the master's web UI")
+        needed = next((f for f in fields.values() if f.required and f.kind != "fixed" and f.full not in params), None)
+        if needed is not None:
+            raise ValueError(f"{name} needs its {needed.label} ({needed.full}): give it")
+        return params
+
+    @staticmethod
     def _builder_id(master: Master, name: str, url: str) -> int:
-        """A builder's id, read from the master by its name."""
-        try:
-            rows, _ = master.listing(f"{API}/builders/{quote(name, safe='')}", "builders")
-        except BuildbotError as e:
-            if e.status == 404:
-                raise ValueError(f"the master at {url} has no builder named {name}") from None
-            raise
+        """A builder's id, read from the master by its name: the collection filtered by it (?name=, one row or none),
+        never an address built of the name (one of digits alone is taken there for an id)."""
+        rows, _ = master.listing(f"{API}/builders", "builders", {"name": name})
         found = next((b for b in rows if b.get("name") == name), None)
         bid = found.get("builderid") if found else None
         if not isinstance(bid, int) or isinstance(bid, bool):
@@ -546,6 +712,8 @@ class BuildbotPlugin(MachinePlugin):
 
     # -- what the platform's page draws ------------------------------------------------------------------------------
     def _summary(self, r: Reading) -> str:
+        if r.underway:
+            return f"Buildbot at {r.url}: a read is under way"
         if not r.answering:
             if not r.url:
                 return "BUILDBOT_URL is not an address"
@@ -579,6 +747,8 @@ class BuildbotPlugin(MachinePlugin):
         return out
 
     def _tables(self, r: Reading) -> list[dict]:
+        if r.underway:
+            return [self._here_table(r)]
         if not r.answering:
             return [self._here_table(r), self._install_table(r)]
         forcing = self._forcing(r)
@@ -586,18 +756,36 @@ class BuildbotPlugin(MachinePlugin):
                 self._schedulers_table(r), self._here_table(r)]
 
     @staticmethod
-    def _schedulers(r: Reading) -> list[dict]:
-        """The force schedulers given a form: those whose name is one, by name, FORMS at most."""
-        named = [s for s in r.schedulers or () if isinstance(s.get("name"), str) and SCHEDULER.match(s["name"])]
+    def _no_form(s: dict) -> str:
+        """Why a force scheduler gets no Force… here, in words; "" when it gets one."""
+        name = s.get("name")
+        if not isinstance(name, str) or not SCHEDULER.match(name):
+            return ("its name is not one the master's REST API takes in an address (ASCII letters, digits, _ and -): "
+                    "force it from the master's web UI")
+        if not starts_of(s):
+            return "it starts no builder"
+        fields = fields_of(s)
+        missing = unfillable(fields)
+        if missing is not None:
+            return (f"it needs its {missing.label} ({missing.full}), which this page cannot fill "
+                    f"({missing.not_offered()}): force it from the master's web UI")
+        many = len(offered(fields))
+        if many > FIELDS_MOST:
+            return (f"it has {many} fields, more than a form here holds ({FIELDS_MOST}): force it from the master's "
+                    "web UI")
+        return ""
+
+    def _schedulers(self, r: Reading) -> list[dict]:
+        """The force schedulers given a form: those it can fill (_no_form), by name, FORMS at most."""
+        named = [s for s in r.schedulers or () if not self._no_form(s)]
         return sorted(named, key=lambda s: s["name"].lower())[:FORMS]
 
     def _forcing(self, r: Reading) -> dict[str, str]:
         """Each builder a force scheduler starts, by name: the first such scheduler's name (by name)."""
         out: dict[str, str] = {}
         for s in self._schedulers(r):
-            for b in s.get("builder_names") or ():
-                if isinstance(b, str):
-                    out.setdefault(b, s["name"])
+            for b in starts_of(s):
+                out.setdefault(b, s["name"])
         return out
 
     @staticmethod
@@ -617,7 +805,8 @@ class BuildbotPlugin(MachinePlugin):
                 counts[1] += 1
         rows = []
         for b in sorted(r.builders or (), key=lambda x: line(x.get("name")).lower()):
-            name, bid = line(b.get("name"), TEXT_MOST), b.get("builderid")
+            raw = b.get("name") if isinstance(b.get("name"), str) else ""
+            name, bid = line(raw, TEXT_MOST), b.get("builderid")
             sub = " · ".join(x for x in (line(b.get("description"), 120),
                                          "" if b.get("masterids") else "on no master now") if x)
             newest = last.get(bid)
@@ -626,8 +815,8 @@ class BuildbotPlugin(MachinePlugin):
                           f"{span(r.when - started)} ago" if started else None) if newest else "–")
             up, all_ = on.get(bid, (0, 0))
             tags = ", ".join(line(t, 40) for t in b.get("tags") or () if isinstance(t, str)) or "–"
-            via = forcing.get(name)
-            force = ({"form": f"force:{via}", "title": "Force…", "values": {"builder": name},
+            via = forcing.get(raw)
+            force = ({"form": f"force:{via}", "title": "Force…", "values": {"builder": raw},
                       "label": f"Force a build of {name}", "note": f"through {via}"} if via else "–")
             rows.append([cell(name, sub or None), tags, built, f"{up} of {all_} connected" if all_ else "none", force])
         rows, note = capped(rows, f"on {r.url}", r.totals.get("builders"))
@@ -679,11 +868,15 @@ class BuildbotPlugin(MachinePlugin):
         formed = {s["name"] for s in self._schedulers(r)}
         rows = []
         for s in sorted(r.schedulers or (), key=lambda x: line(x.get("name")).lower()):
-            name = line(s.get("name"), 100)
+            raw = s.get("name") if isinstance(s.get("name"), str) else ""
+            name = line(raw, 100)
             label = line(s.get("label"), 120)
-            starts = ", ".join(line(b, TEXT_MOST) for b in s.get("builder_names") or () if isinstance(b, str))
-            force = ({"form": f"force:{name}", "title": "Force…", "values": {},
-                      "label": f"Force a build through {name}"} if name in formed else "–")
+            starts = ", ".join(line(b, TEXT_MOST) for b in starts_of(s))
+            if raw in formed:
+                force = {"form": f"force:{raw}", "title": "Force…", "values": {},
+                         "label": f"Force a build through {name}"}
+            else:
+                force = cell("–", self._no_form(s) or f"only the first {FORMS} by name have a form here")
             rows.append([cell(name, label if label and label != name else None), starts or "–", force])
         rows, note = capped(rows, f"on {r.url}: each forces a build as its button in the master's web UI does")
         return {"title": "Force schedulers", "note": note, "rows": rows,
@@ -694,7 +887,8 @@ class BuildbotPlugin(MachinePlugin):
 
     @staticmethod
     def _here_table(r: Reading) -> dict:
-        note = "Found by its files alone (nothing is run to know it): " + ", ".join(r.found.looked) + "."
+        note = ("Found by its files alone, and on Windows by its service's registry key (nothing is run to know it): "
+                + ", ".join(r.found.looked) + ".")
         if r.found.trouble:
             note += f" The look failed: {r.found.trouble}."
         rows = [[what, where] for what, where in r.found.rows()][:ROWS]
@@ -718,47 +912,50 @@ class BuildbotPlugin(MachinePlugin):
                 here = "not found here" if kind else "–"
             rows.append([what, command, here, page])
         windows = self._system_name() == "windows"
-        shell = ("typed in your home folder, in the Command Prompt or PowerShell alike" if windows else
-                 "as a Linux or macOS shell types them")
+        shell = ("typed in your home folder, the Command Prompt's way, with PowerShell's under it where it differs"
+                 if windows else "as a Linux or macOS shell types them")
         note = (f"Nothing is installed or started by this plugin: these are Buildbot's documentation's steps (its "
                 f"tutorial's First run), {shell}; the tutorial is written for Unix and adapts to Windows, and inside "
-                "WSL its Linux steps hold. Once the master runs, its web UI and REST API answer at "
-                "http://localhost:8010 (BUILDBOT_URL when they answer elsewhere).")
+                "WSL its Linux steps hold. Every step after the activation is typed in the shell it activated: a "
+                "worker started from another shell runs its builds without the sandbox's programs. Once the master "
+                "runs, its web UI and REST API answer at http://localhost:8010 (BUILDBOT_URL when they answer "
+                "elsewhere).")
         return {"title": "How to install and start Buildbot", "note": note, "rows": rows,
                 "columns": [{"title": "Step"}, {"title": "Command"}, {"title": "Here"}, {"title": "Documentation"}]}
 
     def _forms(self, r: Reading) -> list[dict]:
-        """The forms the platform's page draws (liminal-platform 0.6.0, status.forms): one Force… per force scheduler,
-        its fields the force hook's arguments in order (the scheduler fixed), asked once the user has confirmed it."""
+        """The forms the platform's page draws (liminal-platform 0.6.0, status.forms): one Force… per force scheduler
+        it can fill, its fields the force hook's arguments in order: the scheduler, the builder, the builders it starts
+        and the names of its fields (fixed), then the fields the scheduler's all_fields offer, as its web UI offers
+        them (fields.py); asked once the user has confirmed it."""
         out = []
         for s in self._schedulers(r):
             name = s["name"]
-            starts = [line(b, TEXT_MOST) for b in s.get("builder_names") or () if isinstance(b, str)]
+            starts = starts_of(s)
+            shown = [line(b, TEXT_MOST) for b in starts]
             label = line(s.get("label"), 120) or name
-            every = f"every builder it starts ({', '.join(starts)})" if starts else "every builder it starts"
-            own = "the scheduler's own"
+            every = f"every builder it starts ({', '.join(shown)})"
             button = line(s.get("button_name"), 60) or "Force"
+            fields = offered(fields_of(s))
             out.append({
                 "id": f"force:{name}", "hook": "force", "title": f"Force a build: {label}",
-                "note": (f"On the master at {r.url}, as its web UI's {button} button does. A field left empty takes "
-                         "the scheduler's own value."),
+                "note": (f"On the master at {r.url}, as its web UI's {button} button does: each field is sent under "
+                         "the scheduler's own name for it, and one left empty takes the scheduler's own value."),
                 "fields": [
                     {"name": "scheduler", "label": "Force scheduler", "type": "fixed", "value": name},
                     {"name": "builder", "label": "Builder", "type": "choice", "value": "", "empty": every,
-                     "choices": [{"value": "", "title": "every builder it starts", "note": ", ".join(starts) or "none"},
-                                 *({"value": b, "title": b} for b in starts)]},
-                    {"name": "reason", "label": "Reason", "type": "text", "empty": own, "note": "optional",
-                     "placeholder": "the scheduler's own (force build, unless its master.cfg says another)"},
-                    {"name": "branch", "label": "Branch", "type": "text", "empty": own, "note": "optional",
-                     "placeholder": "the scheduler's own"},
-                    {"name": "revision", "label": "Revision", "type": "text", "empty": own, "note": "optional",
-                     "placeholder": "the scheduler's own (the newest)"}],
+                     "choices": [{"value": "", "title": "every builder it starts", "note": ", ".join(shown)},
+                                 *({"value": b, "title": t} for b, t in zip(starts, shown))]},
+                    {"name": "starts", "label": "Builders it starts", "type": "fixed", "value": joined(starts)},
+                    {"name": "fields", "label": "Sent under the names", "type": "fixed",
+                     "value": ", ".join(f.full for f in fields), "empty": "none: the scheduler's own values"},
+                    *(form_field(f) for f in fields)],
                 "submit": "Review",
                 "confirm": {"title": "Force a build of {builder} through {scheduler}?",
                             "words": (f"The master at {r.url} is asked to build {{builder}} now, as its force "
                                       "scheduler {scheduler} does from its web UI: a build request for each, run once "
-                                      "a worker is free. Reason: {reason}; branch: {branch}; revision: {revision}. "
-                                      "Sent once."),
+                                      "a worker is free, with the values below, each under the scheduler's own name "
+                                      "for it (one left empty takes the scheduler's own). Sent once."),
                             "yes": "Force it"}})
         return out
 
