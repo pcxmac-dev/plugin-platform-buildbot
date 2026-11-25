@@ -8,6 +8,8 @@ import sys
 import time
 import types
 
+import re
+
 import pytest
 
 from liminal_libs.apps.asking import AskRefused
@@ -48,8 +50,9 @@ def world(tmp_path, pairs=None, master=None, digest=DIG):
     return w, p, m
 
 
-def test_its_shipped_pins_are_unread_and_refused(tmp_path):
-    assert all(pin["digest"] == UNREAD for parts in recipe.PINS.values() for pin in parts.values())
+def test_its_shipped_pins_are_read_and_an_unread_one_is_refused(tmp_path):
+    # read from Docker Hub on 2026-11-25 (manifests only); an unread pin is still refused
+    assert all(re.fullmatch(r"sha256:[0-9a-f]{64}", pin["digest"]) and pin["digest"] != UNREAD and pin["size"] > 0 for parts in recipe.PINS.values() for pin in parts.values())
     w, p, _ = world(tmp_path, digest=UNREAD)
     w.grant()
     with pytest.raises(Refusal, match="not pinned by digest yet"):

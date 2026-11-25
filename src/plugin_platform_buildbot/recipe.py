@@ -38,10 +38,10 @@ AUTH_FILE = "liminal.auth"
 HUB = "https://hub.docker.com/r/"
 PINS = {
     "linux": {
-        "master": dict(ref="docker.io/buildbot/buildbot-master:v4.3.0", digest=UNREAD, system="linux",
+        "master": dict(ref="docker.io/buildbot/buildbot-master:v4.3.0", digest="sha256:10785a6789911f98debcd4df949a169846001c264a9c36047da35b9d8c071d19", size=239258072, system="linux",
                        platforms=["linux/amd64"], version="4.3.0", licence="GPL-2.0", page=HUB + "buildbot/buildbot-master",
                        tar=True),
-        "worker": dict(ref="docker.io/buildbot/buildbot-worker:v4.3.0", digest=UNREAD, system="linux",
+        "worker": dict(ref="docker.io/buildbot/buildbot-worker:v4.3.0", digest="sha256:b4ca5b1c603e816494c7ec44f7a01082bf5144aac255ed30624491fb20b38f02", size=296844832, system="linux",
                        platforms=["linux/amd64"], version="4.3.0", licence="GPL-2.0", page=HUB + "buildbot/buildbot-worker",
                        tar=True),
     },
