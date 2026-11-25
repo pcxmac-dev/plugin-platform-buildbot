@@ -59,9 +59,14 @@ class Settings:
     problems: tuple[str, ...] = ()
 
 
-def parse(values: Mapping[str, str]) -> Settings:
-    """The settings from their values by variable (those not set left out or empty)."""
+def parse(values: Mapping[str, str], default: str = "", admin: tuple[str, str] | None = None) -> Settings:
+    """The settings from their values by variable (those not set left out or empty). 0.2.0: `default` is the master's
+    address when BUILDBOT_URL is not set (its container's port), and `admin` the seeded sign-in's (user, password),
+    taken when neither BUILDBOT_USER nor BUILDBOT_PASSWORD is set."""
     url, user, password = (str(values.get(n) or "").strip() for n in NAMES)
+    url = url or default
+    if admin and not user and not password:
+        user, password = admin
     try:
         where = address(url)
     except ValueError as e:
@@ -88,14 +93,14 @@ def parse(values: Mapping[str, str]) -> Settings:
     return Settings(where, user, password, sign_in, tuple(problems))
 
 
-def read(login=None) -> Settings:
+def read(login=None, default: str = "", admin: tuple[str, str] | None = None) -> Settings:
     """The settings as `login` furnishes them (the login of the app the plugin is attached to), else an
     EnvironmentLogin's; a login that cannot be asked furnishes none, and says so (the defaults are used)."""
     asked = login if login is not None else EnvironmentLogin()
     try:
         values = asked.variables(NAMES) or {}
     except Exception as e:  # noqa: BLE001 - a login that cannot be asked: the defaults, and why
-        s = parse({})
+        s = parse({}, default)
         return replace(s, problems=(f"the settings could not be read from the login ({type(e).__name__}): the defaults "
                                     "are used", *s.problems))
-    return parse(values)
+    return parse(values, default, admin)

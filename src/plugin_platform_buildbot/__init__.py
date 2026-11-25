@@ -30,11 +30,20 @@ plugins).
 
 Nothing runs on its own: the plugin reads when the platform asks, holds no process, thread or connection between asks,
 and forgets what it read when its settings change, after a force and when it is detached; a read under way then keeps
-nothing of what it read (its generation is gone), though its asker gets it."""
+nothing of what it read (its generation is gone), though its asker gets it.
+
+0.2.0 (Monday list item 34; service-containers-design §5.4, the user's answers of 2026-11-25: "Containers only",
+"Containers too", "Seeded, PC-only first"): built on the library's ContainedService. A master and a worker beside it are
+installed, started, stopped, updated and removed only as containers, through the container plugin you pick, in its
+plans you approve on the page (recipe.py). Its sign-in is seeded before the first start (a PBKDF2 hash of
+BUILDBOT_ADMIN_PASSWORD, never the password); it runs on this PC alone until that sign-in answers, then Expose… opens
+it to your network. Its usage data is never sent. Force… is asked from its page alone (PAGE_ONLY_HOOKS). A master you
+installed yourself is still found and read; how to install one natively is a line, not a table."""
 from __future__ import annotations
 
 import hashlib
 import json
+import secrets as _secrets
 import os
 import platform
 import re
@@ -43,16 +52,18 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
-from liminal_libs.machines.plugin import MachinePlugin
+from liminal_libs.instances import Refusal
+from liminal_libs.machines.containedservice import ContainedService, Pace
 
 from . import apis as cards
-from .client import API, FORCE_S, LOOK_S, BuildbotError, Master, no_basic
+from . import recipe
+from .client import API, FORCE_S, LOOK_S, BuildbotError, Master, address, no_basic
 from .fields import FIELDS_MOST, TEXT_MOST, fields_of, form_field, offered, typed, typed_fields, unfillable
 from .finders import Finder, Found
 from .settings import KEYS, Settings
 from .settings import read as read_settings
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 READ_S = 30.0  # what was read is kept this long: the platform's page asks every few seconds; a force reads again
 WAIT_S = 2.0  # seconds an ask waits for a read under way, at most: then it takes what was read before
 BUILDS = 20  # the newest builds read
@@ -273,7 +284,7 @@ def versions_of(config) -> dict:
     return out
 
 
-class BuildbotPlugin(MachinePlugin):
+class BuildbotPlugin(ContainedService):
     """A Buildbot master for the platform: present when Buildbot is installed here or a web server answers at the
     master's address, valid when its REST API is read."""
 
@@ -290,7 +301,11 @@ class BuildbotPlugin(MachinePlugin):
     order = 772  # the Continuous Integration plugins in the user's naming: Jenkins 770, GoCD 771, Buildbot 772
     ICON = "buildbot"
     SECTION = "ci"  # drawn under the platform's Continuous Integration plugins; "machine" on a platform before it
-    HOOKS = (*MachinePlugin.HOOKS, "refresh", "force")
+    HOOKS = (*ContainedService.HOOKS, "refresh", "force")
+    LAN_FIRST = False  # seeded sign-in, this PC alone first (the user, 2026-11-25: "Seeded, PC-only first")
+    DEFAULT_MEMORY_MB = recipe.MEMORY_MB
+    # a force runs whatever its builders do: asked from the platform's page alone (design §5.4), with the base's five
+    PAGE_ONLY_HOOKS = ("force",)
     READ_HOOKS = ("refresh",)  # its own read beside its bases' (force changes the master: a build is asked of it)
     INTERNAL_NOTES = (
         "force sends one JSON-RPC call (POST /api/v2/forceschedulers/<name>, method force) once its scheduler is read "
@@ -302,7 +317,9 @@ class BuildbotPlugin(MachinePlugin):
     )
     keys = KEYS  # its settings, kept through the platform's login: the master's address, a user and its password
 
-    def __init__(self, http=None, find=None, clock=None, wall=None, system=None):
+    def __init__(self, http=None, find=None, clock=None, wall=None, system=None, pace: Pace | None = None, pins=None):
+        ContainedService.__init__(self, pace)
+        self._pins = pins  # recipe.PINS unless a test's
         self._http = http  # (method, url, headers, body, timeout) -> (status, headers, body): urllib's unless given
         self._find = find  # () -> finders.Found: a look at this machine (finders.Finder) unless given
         self._clock = clock or time.monotonic
@@ -383,7 +400,7 @@ class BuildbotPlugin(MachinePlugin):
                 kept, generation = rt.reading, rt.generation
             if kept is not None and not fresh and self._clock() - kept.at < READ_S:
                 return kept  # read meanwhile by the asker waited on
-            reading = self._ask(read_settings(self.login), self._found(), generation)
+            reading = self._ask(self._settings(), self._found(), generation)
             with rt.lock:
                 if rt.generation == generation:
                     rt.reading = reading
@@ -394,7 +411,7 @@ class BuildbotPlugin(MachinePlugin):
     def _underway(self) -> Reading:
         """A reading saying another asker's read of the master is under way (never kept): this machine is looked at
         all the same."""
-        s = read_settings(self.login)
+        s = self._settings()
         url = s.where.base if s.where is not None else ""
         why = f"a read of the master at {url} is under way: its answer is not in yet" if url else s.problems[0]
         return Reading(self._clock(), self._wall(), url, self._found(), why=why, notes=tuple(s.problems),
@@ -487,6 +504,65 @@ class BuildbotPlugin(MachinePlugin):
             self._rt.reading = None
             self._rt.generation += 1
 
+    # -- its containers (ContainedService) ------------------------------------------------------------------------
+    def _pair(self, name: str) -> str:
+        try:
+            got = (self.login.variables([name]) or {}) if self.login is not None else {}
+        except Exception:  # noqa: BLE001 - a login that cannot be asked: none set
+            return ""
+        return str(got.get(name) or "")
+
+    def _settings(self) -> Settings:
+        """Its settings through its login: BUILDBOT_URL, else its container's port; with no user of yours set, the
+        seeded admin's sign-in while a master of its is placed."""
+        admin = None
+        if self.service_present():
+            password = self._pair(recipe.ADMIN_PASSWORD)
+            admin = (recipe.ADMIN, password) if password else None
+        return read_settings(self.login, self.address(), admin)
+
+    def spec_for(self, system, name, options):
+        """Buildbot's recipe (recipe.py): its master, its sign-in seeded as a hash, and a worker beside it. The
+        worker's password is made here once, and kept through the login."""
+        fit = bool(options.get("fit"))
+        if not fit and not self._pair(recipe.WORKER_PASSWORD) and self.login is not None:
+            self.login.save(recipe.WORKER_PASSWORD, _secrets.token_urlsafe(24))
+        return recipe.spec(system, name, options, "" if fit else self._pair(recipe.ADMIN_PASSWORD), self._pins)
+
+    def _config_at(self, hosted) -> dict:
+        master = Master(address(self.address(hosted)), transport=self._http, timeout=LOOK_S, clock=self._clock)
+        got = master.get("/config")
+        if not isinstance(got, dict):
+            raise BuildbotError("GET /config: its answer is not a master's configuration")
+        return got
+
+    def ready(self, hosted):
+        """Whether the master answers at its container's port: its /config."""
+        try:
+            self._config_at(hosted)
+        except (BuildbotError, ValueError) as e:
+            return False, str(e)
+        return True, ""
+
+    def lan_ready(self, hosted):
+        """Whether its seeded sign-in answers: its /config names a sign-in, not NoAuth."""
+        try:
+            auth = self._config_at(hosted).get("auth")
+        except (BuildbotError, ValueError) as e:
+            return False, str(e)
+        name = str(auth.get("name") or "") if isinstance(auth, dict) else ""
+        if not name or name == "NoAuth":
+            return False, "its /config names no sign-in (NoAuth): it stays on this PC"
+        return True, ""
+
+    def after(self, action, hosted, line):
+        """Read again after any change of its containers."""
+        self._forget()
+        if action == "install":
+            return [f"Buildbot runs at {self.address(hosted)}: sign in as admin with {recipe.ADMIN_PASSWORD}; its "
+                    "worker liminal-worker builds the hello builder"]
+        return []
+
     def settings_changed(self) -> None:
         """Its settings kept anew on the platform's page: what was read is forgotten (a read under way keeps nothing),
         and a sign-in the master refused may be sent again, so the next look asks the address now set, as the user
@@ -517,13 +593,19 @@ class BuildbotPlugin(MachinePlugin):
         """What the platform's page draws (kept READ_S): present, valid and why not, the summary, the facts, the tables,
         the Force… forms (while the master is read) and Read again; what could not be read, in words (`problem`)."""
         r = self._read()
-        out: dict = {"present": r.present, "summary": self._summary(r), "valid": r.answering,
-                     "why": "" if r.answering else r.why or "the master was not read"}
+        out: dict = {"present": r.present or self.service_present(), "summary": self._summary(r),
+                     "valid": r.answering or self.service_valid(), "why": ""}
+        if not r.answering:
+            out["note"] = r.why or "the master was not read"  # said, never invalid: it can be placed in a container
         out.update(self._facts(r))
         out["tables"] = self._tables(r)
         out["forms"] = self._forms(r) if r.answering else []
         out["actions"] = [{"hook": "refresh", "args": [], "title": "Read again",
                            "note": f"asks the master again now (what was read is kept {READ_S:g} s)"}]
+        if self.app is not None:  # where it can run, asked of the container plugins through its app
+            svc = self.service_status()
+            out["tables"] += svc.get("tables") or []
+            out["forms"] += svc.get("forms") or []
         trouble = list(r.notes)
         if r.answering:
             trouble += [f"its {LABELS[kind]} could not be read: {why}" for kind, why in r.problems.items()
@@ -596,7 +678,7 @@ class BuildbotPlugin(MachinePlugin):
             raise ValueError(f"not a force scheduler's name: {name[:60]!r} (ASCII letters, digits, _ and -)")
         chosen = typed(builder, "a builder's name")
         given = typed_fields(fields, values)
-        s = read_settings(self.login)
+        s = self._settings()
         if s.where is None:
             raise ValueError(s.problems[0])
         url = s.where.base
@@ -750,7 +832,7 @@ class BuildbotPlugin(MachinePlugin):
         if r.underway:
             return [self._here_table(r)]
         if not r.answering:
-            return [self._here_table(r), self._install_table(r)]
+            return [self._here_table(r), self._install_table(r)]  # 0.2.0: beside Install… in a container
         forcing = self._forcing(r)
         return [self._builders_table(r, forcing), self._builds_table(r), self._workers_table(r),
                 self._schedulers_table(r), self._here_table(r)]
@@ -914,13 +996,14 @@ class BuildbotPlugin(MachinePlugin):
         windows = self._system_name() == "windows"
         shell = ("typed in your home folder, the Command Prompt's way, with PowerShell's under it where it differs"
                  if windows else "as a Linux or macOS shell types them")
-        note = (f"Nothing is installed or started by this plugin: these are Buildbot's documentation's steps (its "
+        note = (f"Buildbot runs in a container through Install… (above); one you install yourself is found and read. "
+                f"This plugin installs nothing natively: these are Buildbot's documentation's steps (its "
                 f"tutorial's First run), {shell}; the tutorial is written for Unix and adapts to Windows, and inside "
                 "WSL its Linux steps hold. Every step after the activation is typed in the shell it activated: a "
                 "worker started from another shell runs its builds without the sandbox's programs. Once the master "
                 "runs, its web UI and REST API answer at http://localhost:8010 (BUILDBOT_URL when they answer "
                 "elsewhere).")
-        return {"title": "How to install and start Buildbot", "note": note, "rows": rows,
+        return {"title": "Or install it yourself", "note": note, "rows": rows,
                 "columns": [{"title": "Step"}, {"title": "Command"}, {"title": "Here"}, {"title": "Documentation"}]}
 
     def _forms(self, r: Reading) -> list[dict]:

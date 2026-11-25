@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plugin-platform-buildbot"
-version = "0.1.0"  # the plugin's own release (CHANGELOG.md); the app shows it on the Plugins view
+version = "0.2.0"  # the plugin's own release (CHANGELOG.md); the app shows it on the Plugins view
 description = "Buildbot for Liminal: a master's builders, recent builds, workers and force schedulers read from its REST API, whether Buildbot is installed here, and a build forced once the platform's page confirms it."
 readme = "README.md"
 requires-python = ">=3.10"
 # the library it plugs into (the machine kind: liminal_libs.machines, plugin API 2.2: what it attaches to, its API
 # cards, since 1.49.0); its HTTP is the standard library's (client.py), so it needs nothing newer
-dependencies = ["liminal-libs>=1.49.0"]
+# 1.94.0: ContainedService, the base it is built on (its containers through a container plugin's plans)
+dependencies = ["liminal-libs>=1.94.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

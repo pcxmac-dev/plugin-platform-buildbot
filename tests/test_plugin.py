@@ -186,8 +186,8 @@ def test_a_master_that_stops_answering_leaves_the_rest_not_asked():
 
 def test_something_that_is_not_buildbot_is_said_as_such():
     s = plugin(Master(other=True)).status()
-    assert s["present"] is True and s["valid"] is False  # a web server answers there, not Buildbot's API
-    assert s["why"] == (f"something answers at {BASE}, but not Buildbot's REST API (GET /api/v2/builders: HTTP 404: "
+    assert s["present"] is True and s["valid"] is True  # a web server answers there, not Buildbot's API
+    assert s["note"] == (f"something answers at {BASE}, but not Buildbot's REST API (GET /api/v2/builders: HTTP 404: "
                         "No Such Resource): is BUILDBOT_URL the master's web address, as its web UI is opened?")
     assert s["summary"] == f"Buildbot at {BASE} could not be read"
 
@@ -233,14 +233,14 @@ def test_present_on_windows_by_the_tutorials_files(tmp_path):
     p = plugin(m, finds=look.find, system="windows")
     assert p.present() is True  # installed here, though no master answers
     s = p.status()
-    assert s["present"] is True and s["valid"] is False and s["forms"] == []
+    assert s["present"] is True and s["valid"] is True and s["forms"] == []
     assert s["summary"] == f"Buildbot is installed here; nothing answers at {BASE}"
-    assert s["why"] == f"nothing answers at {BASE}: GET /config: nothing answers there (the connection was refused)"
+    assert s["note"] == f"nothing answers at {BASE}: GET /config: nothing answers there (the connection was refused)"
     assert m.paths == ["GET /config"]  # the first request got no answer: nothing more is asked
     assert s["here"] == "2 buildbot commands, 2 master folders, 1 buildbot-worker command, 1 worker folder"
     assert [r[0] for r in table(s, "Buildbot here")["rows"]] == ["buildbot command"] * 2 + ["master"] * 2 + [
         "buildbot-worker command", "worker"]
-    steps = table(s, "How to install and start Buildbot")
+    steps = table(s, "Or install it yourself")
     assert [r[1] for r in steps["rows"]] == [  # typed in the home folder: the Command Prompt's way, PowerShell's under
         "git --version",
         r"py -m venv buildbot\sandbox",
@@ -283,7 +283,7 @@ def test_present_on_linux_by_a_package_and_its_systemd_units(tmp_path):
     assert "systemd's unit folders (buildbot*.service)" in got.looked
     p = plugin(Master(down=True), finds=look.find, system="linux")
     assert p.present() is True
-    steps = table(p.status(), "How to install and start Buildbot")
+    steps = table(p.status(), "Or install it yourself")
     assert [r[1] for r in steps["rows"]][:7] == [
         "git --version", "python3 -m venv ~/buildbot/sandbox", "source ~/buildbot/sandbox/bin/activate",
         {"text": "pip install 'buildbot[bundle]'",
@@ -348,10 +348,10 @@ def test_not_present_when_nothing_is_installed_and_nothing_answers():
     p = plugin(m, finds=found())
     assert p.present() is False
     s = p.status()
-    assert s["present"] is False and s["valid"] is False
+    assert s["present"] is False and s["valid"] is True
     assert s["summary"] == f"Buildbot is not installed here; nothing answers at {BASE}"
     assert table(s, "Buildbot here")["empty"] == "Nothing of Buildbot's on this machine."
-    steps = table(s, "How to install and start Buildbot")
+    steps = table(s, "Or install it yourself")
     assert [r[2] for r in steps["rows"]] == ["–", "–", "–", "not found here", "not found here", "–",
                                              f"nothing answers at {BASE}", "not found here", "not found here", "–"]
     assert steps["rows"][3][3] == "https://docs.buildbot.net/latest/tutorial/firstrun.html"
@@ -384,19 +384,19 @@ def test_a_master_that_asks_a_sign_in_is_signed_in_to_and_read():
 def test_a_sign_in_refused_is_said_and_the_master_read_as_anyone():
     m = Master(users={"homer": "another"}, private=True)
     s = plugin(m, BUILDBOT_USER="homer", BUILDBOT_PASSWORD=PASSWORD).status()
-    assert s["valid"] is False
-    assert s["why"] == (f"the master at {BASE} refuses its builders to anyone not signed in (HTTP 403): the master "
+    assert s["valid"] is True
+    assert s["note"] == (f"the master at {BASE} refuses its builders to anyone not signed in (HTTP 403): the master "
                         "refused the sign-in as homer (HTTP 401): BUILDBOT_USER or BUILDBOT_PASSWORD is not one it "
                         "knows; read as anyone")
     s = plugin(Master(private=True)).status()  # no user set
-    assert s["why"].endswith("(HTTP 403): set BUILDBOT_USER and BUILDBOT_PASSWORD (a user it knows)")
+    assert s["note"].endswith("(HTTP 403): set BUILDBOT_USER and BUILDBOT_PASSWORD (a user it knows)")
     # a sign-in of the master's own (a CustomAuth of its master.cfg, named as its class is): asked, and its refusal
     # said without blaming the user and the password alone
     m = Master(users={"homer": "another"}, private=True, auth="LdapAuth")
     s = plugin(m, BUILDBOT_USER="homer", BUILDBOT_PASSWORD=PASSWORD).status()
-    assert "GET /auth/login" in m.paths and "not one it knows" not in s["why"]
+    assert "GET /auth/login" in m.paths and "not one it knows" not in s["note"]
     assert ("the master refused the sign-in as homer (HTTP 401): its sign-in (LdapAuth) may take no user and password "
-            "at /auth/login; read as anyone") in s["why"]
+            "at /auth/login; read as anyone") in s["note"]
 
 
 @pytest.mark.parametrize("given, words", [
@@ -425,7 +425,7 @@ def test_a_refused_sign_in_is_not_sent_again_until_the_settings_change_or_read_a
         s = p.status()
     assert m.paths.count("GET /auth/login") == 1
     assert ("the master refused the sign-in as homer before: it is not sent again until the settings change or Read "
-            "again asks; read as anyone") in s["why"] and PASSWORD not in json.dumps(s)
+            "again asks; read as anyone") in s["note"] and PASSWORD not in json.dumps(s)
     with pytest.raises(cl.BuildbotError, match=r"HTTP 403: .*; the master refused the sign-in as homer before: it is "
                                                r"not sent again"):  # nor a force's (the master refuses it as anyone's)
         p.force("force", "runtests")
@@ -507,7 +507,7 @@ def test_a_password_too_short_to_be_kept_out_of_words_is_not_sent():
     s = plugin(m, BUILDBOT_USER="homer", BUILDBOT_PASSWORD="abc").status()
     assert "GET /auth/login" not in m.paths
     assert ("BUILDBOT_PASSWORD is shorter than 4 characters, too short to be kept out of what the master says back: it "
-            "is not sent; read without signing in") in s["why"]
+            "is not sent; read without signing in") in s["note"]
 
 
 def test_the_password_never_goes_over_plain_http_to_another_machine():
@@ -798,9 +798,9 @@ def test_the_page_never_waits_behind_a_read_under_way(monkeypatch):
     p._http = slow
     s = p.status()
     assert s["valid"] is True and inner["waited"] is False and inner["asked"] == 0
-    assert inner["status"]["valid"] is False
+    assert inner["status"]["valid"] is True
     assert inner["status"]["summary"] == f"Buildbot at {BASE}: a read is under way"
-    assert inner["status"]["why"] == f"a read of the master at {BASE} is under way: its answer is not in yet"
+    assert inner["status"]["note"] == f"a read of the master at {BASE} is under way: its answer is not in yet"
     assert [t["title"] for t in inner["status"]["tables"]] == ["Buildbot here"] and inner["present"] is False
     # once a reading is kept, an ask during the next read gets it, kept, without waiting
     p._clock.t += bb.READ_S + 1
@@ -859,8 +859,8 @@ def test_a_read_under_way_keeps_nothing_once_detached_or_forced():
 def test_a_redirect_is_said_and_never_followed():
     m = Master(redirect="https://ci.example.org")
     s = plugin(m).status()
-    assert s["present"] is True and s["valid"] is False
-    assert s["why"] == (f"the master at {BASE} could not be read: GET /api/v2/builders: the master sent it on to "
+    assert s["present"] is True and s["valid"] is True
+    assert s["note"] == (f"the master at {BASE} could not be read: GET /api/v2/builders: the master sent it on to "
                         "https://ci.example.org/api/v2/builders (HTTP 302), which is not followed: only "
                         f"{BASE} is asked")
     assert all(url.startswith(BASE + "/") for _, url, *_ in m.asked)  # never the address it was sent on to
@@ -1054,9 +1054,9 @@ def test_the_settings_come_through_the_login():
     for typed in (f"http://homer:{PASSWORD}@ci.example.org", "http://homer:12/secret@ci.example.org"):
         nobody = Master()
         s = plugin(nobody, BUILDBOT_URL=typed).status()
-        assert s["valid"] is False and nobody.asked == [] and PASSWORD not in json.dumps(s)
+        assert s["valid"] is True and nobody.asked == [] and PASSWORD not in json.dumps(s)
         assert "secret" not in json.dumps(s) and "homer" not in json.dumps(s)
-        assert s["why"].startswith("BUILDBOT_URL carries no user name and no password") and s["address"].startswith(
+        assert s["note"].startswith("BUILDBOT_URL carries no user name and no password") and s["address"].startswith(
             "none")
         assert s["summary"] == "BUILDBOT_URL is not an address"
     half = plugin(Master(), BUILDBOT_USER="homer").status()
@@ -1085,7 +1085,7 @@ def test_settings_changed_and_a_detach_forget_what_was_read():
 
 
 def test_the_plugin_is_one_the_platform_loads():
-    assert isinstance(bb.MACHINE, BuildbotPlugin) and bb.__version__ == "0.1.0"
+    assert isinstance(bb.MACHINE, BuildbotPlugin) and bb.__version__ == "0.2.0"
     assert [k.name for k in bb.MACHINE.keys] == ["BUILDBOT_URL", "BUILDBOT_USER", "BUILDBOT_PASSWORD"]
     assert [k.secret for k in bb.MACHINE.keys] == [False, False, True]
     assert all(k.hint.startswith("optional") for k in bb.MACHINE.keys)  # the page draws them as optional

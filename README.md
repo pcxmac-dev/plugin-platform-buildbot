@@ -1,5 +1,11 @@
 # plugin-platform-buildbot
 
+0.2.0 (liminal-libs 1.94.0's ContainedService): Buildbot runs only as containers, each change a plan of the container
+plugin's that you approve on the page. Install… puts a master and a worker in containers through the container plugin
+you pick, its sign-in seeded as a PBKDF2 hash of `BUILDBOT_ADMIN_PASSWORD`, on this PC alone until that sign-in
+answers (then Expose…); Force… is its page's alone. The native install steps below describe a Buildbot of your own,
+which is still found and read; this plugin installs nothing natively.
+
 Buildbot for Liminal: a Buildbot master's builders, recent builds, workers and force schedulers, read from its REST API;
 whether Buildbot is installed on this machine; and a build forced through a force scheduler once the platform's page
 has confirmed it.

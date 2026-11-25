@@ -41,8 +41,6 @@ def test_what_it_shares_on_its_internal_api_tab_is_sound():
     assert module.MACHINE.READ_HOOKS == ("refresh",)
 
 
-@pytest.mark.xfail(strict=True, reason="the library's icons.js has no buildbot mark yet: until it has, the tray and "
-                                       "the page draw the plug (its icon for a name it does not have) for Buildbot")
 def test_its_icon_is_one_the_platforms_page_draws():
     """The tray and the page draw a plugin's icon by its name in the library's icons.js, and the plug for a name it does
     not have. Until Buildbot's mark is added there this fails as expected; once it is, it passes, its strict xfail
@@ -54,8 +52,8 @@ def test_its_icon_is_one_the_platforms_page_draws():
 def test_the_platform_finds_it_by_its_entry_point():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["entry-points"]["liminal.providers"] == {"buildbot": "plugin_platform_buildbot"}
-    assert project["name"] == "plugin-platform-buildbot" and project["version"] == module.__version__ == "0.1.0"
-    assert project["dependencies"] == ["liminal-libs>=1.49.0"]  # the docker plugin's floor: nothing newer is needed
+    assert project["name"] == "plugin-platform-buildbot" and project["version"] == module.__version__ == "0.2.0"
+    assert project["dependencies"] == ["liminal-libs>=1.94.0"]  # ContainedService, the base it is built on
 
 
 def test_its_ci_gives_the_code_it_runs_no_token_and_nothing_that_moves():

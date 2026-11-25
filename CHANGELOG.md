@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0 (2026-11-25)
+
+A Buildbot master and its worker in containers (Monday list item 34; service-containers-design §5.4, with the user's
+answers of 2026-11-25: "Containers only", "Containers too", "Seeded, PC-only first", reporting to the makers off, images
+pinned by digest). Needs liminal-libs>=1.94.0 (ContainedService).
+
+- **Built on ContainedService**: the master and a worker beside it are installed, started, stopped, updated, removed
+  and their data deleted only as containers, through the container plugin you pick, each a plan of that plugin's you
+  approve on the page; its page lists where it can run and why a target is not offered.
+- **Its recipe** (recipe.py): the master (8010; its base folder in a volume; 9989 for the worker on the service's own
+  network alone; at most 1 GB) and the worker `liminal-worker`. Linux images alone (not yet on Windows containers,
+  decision 14), by tag and digest; the digests are not read yet (UNREAD), and Install… refuses until a release reads
+  them from Docker Hub.
+- **Seeded before the first start**, into the new volume alone: a `master.cfg` with `c['buildbotNetUsageData'] = None`,
+  the worker, a `hello` builder and its force scheduler, and a CustomAuth (`LiminalAuth`) checking `admin`'s password
+  against a salted PBKDF2-SHA256 hash in `liminal.auth` (of `BUILDBOT_ADMIN_PASSWORD`, 12 characters at least: never
+  the password), every control endpoint the admin's. The worker's password is made once by the plugin and kept through
+  the login (`BUILDBOT_WORKER_PASSWORD`), handed to both containers by environment alone.
+- **This PC alone first**: Install… offers no "your network"; Expose… opens it only once its /config names the seeded
+  sign-in. Its reads sign in as the seeded admin while it is placed and no BUILDBOT_USER of yours is set; its address
+  is BUILDBOT_URL, else its container's port.
+- **Force… is its page's alone** (`PAGE_ONLY_HOOKS`), as the design asked.
+- A master you installed yourself is found and read as before; the tutorial's steps stay as "Or install it yourself",
+  beside Install… in a container. Valid while it can be placed: not answering is a note. Its icon test is no longer an
+  expected failure: the library draws Buildbot's mark.
+
 ## 0.1.0 (2026-11-23)
 
 The first release (the user, 2026-11-22: a Continuous Integration class of platform plugins, with Jenkins, GoCD and
